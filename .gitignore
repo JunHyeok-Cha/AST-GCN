@@ -1,0 +1,47 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# 패키지 빌드 산출물
+build/
+dist/
+.eggs/
+*.egg-info/
+
+# 가상환경 / Conda 환경
+.env/
+.venv/
+env/
+venv/
+.conda/
+*.conda-env
+
+# 캐시 / 로그
+*.log
+*.tmp
+*.swp
+*.swo
+.cache/
+.mypy_cache/
+.pytest_cache/
+
+# -------------------------
+# Jupyter / 데이터 분석
+# -------------------------
+.ipynb_checkpoints/
+.jupyter/
+
+# -------------------------
+# IDE / OS 잡파일
+# -------------------------
+.vscode/
+*.code-workspace
+.idea/
+
+.DS_Store
+Thumbs.db
