@@ -64,3 +64,21 @@ FINAL_NODE_FEATURES...csv의 osmid 컬럼이 이 nodes 레이어의 osmid를 참
 edges (링크/선):
 그래프의 '링크(Link)'이며, 노드와 노드를 연결하는 도로 구간을 의미합니다.
 이 edges 정보를 바탕으로 모델이 학습할 '인접 행렬(Adjacency Matrix)'을 생성할 수 있습니다.
+
+
+
+- 사용 모델
+1. No-Graph Baseline (MLP / LSTM per node)
+그래프 안 쓰고, 각 노드의 시간 시퀀스만 써서 예측
+“그래프 정보를 쓰면 얼마나 좋아졌는지”를 보여줄 비교용
+
+2. ST-GCN
+Spatial: GCN (or ChebConv)
+Temporal: 1D CNN / GRU
+Attention, periodicity 없이 단순 구조
+
+3. AST-GCN
+
+“Baseline → ST-GCN → AST-GCN” 성능 향상 분석
+
++ 추후 발전된 모델 사용 가능
