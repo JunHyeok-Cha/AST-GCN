@@ -15,6 +15,7 @@
 
 from pathlib import Path
 from typing import Tuple
+from typing import Optional
 
 import numpy as np
 import torch
@@ -26,11 +27,11 @@ from torch.utils.data import Dataset, DataLoader, Subset
 # 0. 공통 설정 + 하이퍼파라미터
 # =========================
 
-data_dir = Path("/mnt/c/Source/python/AST-GCN/res")
+data_dir = Path("/mnt/c/새 폴더/res")
 
 X_path = data_dir / "X_samples.npy"      # (S, N, T_in, F)
 Y_path = data_dir / "Y_samples.npy"      # (S, N, T_out, 2)
-A_path = data_dir / "adjacency_norm.npy" # (N, N)
+A_path = data_dir / "adjacency_corr_norm.npy" # (N, N)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -40,6 +41,79 @@ HIDDEN_CHANNELS = 32       # 32 / 64 / 128 등 바꿔가면서 실험
 NUM_BLOCKS      = 1        # 1 or 2 (over-smoothing 피하려면 1부터)
 LR              = 5e-4     # 1e-3 → 5e-4 / 1e-4 등 시도
 DROPOUT_P       = 0.1      # block 내부 dropout 비율
+
+# =========================
+# 추가. 학습 가능한 A
+# =========================
+
+class AdaptiveAdjacencyMasked(nn.Module):
+    """
+    Masked Adaptive Adjacency (sparse):
+      - 그래프 구조(간선)는 고정 (A_fixed > 0 인 곳만)
+      - 그 간선 가중치만 학습: A'_ij ∝ exp(ReLU(E_i · E_j))
+      - row-wise softmax (각 row에서 이웃들만 softmax)
+    """
+
+    def __init__(self, A_fixed: np.ndarray, emb_dim: int = 16):
+        super().__init__()
+        assert A_fixed.ndim == 2 and A_fixed.shape[0] == A_fixed.shape[1]
+        self.N = A_fixed.shape[0]
+
+        # node embedding (학습 파라미터)
+        self.E = nn.Parameter(torch.randn(self.N, emb_dim) * 0.1)
+
+        # edge list (A_fixed > 0) + self-loop
+        rows, cols = np.where(A_fixed > 0)
+        self_loops = np.arange(self.N)
+        rows = np.concatenate([rows, self_loops])
+        cols = np.concatenate([cols, self_loops])
+
+        # 정렬(선택)
+        order = np.lexsort((cols, rows))
+        rows = rows[order].astype(np.int64)
+        cols = cols[order].astype(np.int64)
+
+        self.register_buffer("edge_row", torch.from_numpy(rows).long())
+        self.register_buffer("edge_col", torch.from_numpy(cols).long())
+
+    def forward(self) -> torch.Tensor:
+        """
+        return: sparse COO adjacency (N,N), row-stochastic
+        """
+        row = self.edge_row
+        col = self.edge_col
+
+        # score_e = ReLU( E_row · E_col )
+        score = torch.relu((self.E[row] * self.E[col]).sum(dim=1))  # (E,)
+
+        # ---- row-wise softmax (벡터화) ----
+        # max per row
+        max_row = torch.full((self.N,), -1e15, device=score.device, dtype=score.dtype)
+
+        if hasattr(max_row, "scatter_reduce_"):
+            # PyTorch 최신이면 이게 됨
+            max_row.scatter_reduce_(0, row, score, reduce="amax", include_self=True)
+
+            exp_score = torch.exp(score - max_row[row])
+            sum_row = torch.zeros((self.N,), device=score.device, dtype=score.dtype)
+            sum_row.scatter_add_(0, row, exp_score)
+
+            vals = exp_score / (sum_row[row] + 1e-12)
+        else:
+            # fallback (느리지만 에러는 안 남)
+            vals = torch.empty_like(score)
+            # row별로 마스크 추출이 어려우니 groupby 느낌으로 처리
+            # (정렬되어 있다는 가정이 있으면 더 깔끔한데, 여기선 안전하게 처리)
+            for i in range(self.N):
+                mask = (row == i)
+                if mask.any():
+                    s = score[mask]
+                    w = torch.softmax(s, dim=0)
+                    vals[mask] = w
+
+        idx = torch.stack([row, col], dim=0)  # (2, E)
+        A_adp = torch.sparse_coo_tensor(idx, vals, (self.N, self.N)).coalesce()
+        return A_adp
 
 
 # =========================
@@ -119,30 +193,44 @@ def get_dataloaders(
 
 class GraphConv(nn.Module):
     """
-    (아주 단순한) 그래프 컨볼루션 레이어.
+    고정 adjacency(A_fixed) + adaptive adjacency(A_adp)를 혼합.
 
-    입력:
-      x: (B, C_in, T, N)
-      A: (N, N)
-
-    동작:
-      1) 채널 방향 1x1 Conv (theta) 로 피처 변환
-      2) 인접행렬 A 를 사용해 노드 방향으로 메시지 전달:
-         y[b, c, t, i] = sum_j A[i, j] * x_theta[b, c, t, j]
+    y = (1-beta) * (A_fixed 메시지패싱) + beta * (A_adp 메시지패싱)
     """
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, beta: float = 0.3):
         super().__init__()
-        self.theta = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=(1, 1),
-        )
+        self.theta = nn.Conv2d(in_channels, out_channels, kernel_size=(1, 1))
+        self.beta = beta
 
-    def forward(self, x: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+    def _propagate(self, x: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, T, N)
+        A: (N, N) sparse or dense
+        return: (B, C, T, N)
+        """
+        B, C, T, N = x.shape
+        X = x.reshape(B * C * T, N)  # (BCT, N)
+
+        if A.is_sparse:
+            # (A @ X^T)^T
+            Y = torch.sparse.mm(A, X.t()).t()  # (BCT, N)
+        else:
+            Y = X @ A.t()  # (BCT, N)
+
+        return Y.view(B, C, T, N)
+
+    def forward(self, x: torch.Tensor, A_fixed: torch.Tensor, A_adp: Optional[torch.Tensor] = None) -> torch.Tensor:
         x = self.theta(x)  # (B, C_out, T, N)
-        x = torch.einsum("ij, bctj -> bcti", A, x)  # (B, C_out, T, N)
-        return x
+
+        out_fixed = self._propagate(x, A_fixed)
+        if A_adp is None:
+            return out_fixed
+
+        out_adp = self._propagate(x, A_adp)
+        return (1.0 - self.beta) * out_fixed + self.beta * out_adp
+
+
 
 
 class STGCNBlock(nn.Module):
@@ -159,7 +247,6 @@ class STGCNBlock(nn.Module):
     - in_channels != out_channels 인 경우,
       residual 연결 전에 1x1 Conv 로 projection 진행.
     """
-
     def __init__(
         self,
         in_channels: int,
@@ -167,89 +254,37 @@ class STGCNBlock(nn.Module):
         kernel_size: int = 3,
         use_residual: bool = True,
         dropout: float = 0.1,
+        gcn_beta: float = 0.3,
     ):
         super().__init__()
         padding = kernel_size // 2
-
         self.use_residual = use_residual
-        self.dropout_p = dropout
 
-        # 시간축에만 conv
-        self.temporal1 = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=(kernel_size, 1),
-            padding=(padding, 0),
-        )
+        self.temporal1 = nn.Conv2d(in_channels, out_channels, (kernel_size, 1), padding=(padding, 0))
+        self.graph_conv = GraphConv(out_channels, out_channels, beta=gcn_beta)
+        self.temporal2 = nn.Conv2d(out_channels, out_channels, (kernel_size, 1), padding=(padding, 0))
 
-        self.graph_conv = GraphConv(
-            in_channels=out_channels,
-            out_channels=out_channels,
-        )
-
-        self.temporal2 = nn.Conv2d(
-            in_channels=out_channels,
-            out_channels=out_channels,
-            kernel_size=(kernel_size, 1),
-            padding=(padding, 0),
-        )
-
-        # residual projection (채널 수가 다를 때만 사용)
-        if use_residual and in_channels != out_channels:
-            self.res_proj = nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=(1, 1),
-            )
-        else:
-            self.res_proj = None
-
+        self.res_proj = nn.Conv2d(in_channels, out_channels, (1, 1)) if (use_residual and in_channels != out_channels) else None
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout2d(p=dropout) if dropout > 0 else nn.Identity()
 
-    def forward(self, x: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, C_in, T, N)
-        A: (N, N)
-        return: (B, C_out, T, N)
-        """
+    def forward(self, x: torch.Tensor, A_fixed: torch.Tensor, A_adp: Optional[torch.Tensor] = None) -> torch.Tensor:
         identity = x
 
-        # 1) Temporal Conv -> ReLU
-        out = self.temporal1(x)
-        out = self.relu(out)
-
-        # 2) Graph Conv -> ReLU
-        out = self.graph_conv(out, A)
-        out = self.relu(out)
-
-        # 3) 다시 Temporal Conv
+        out = self.relu(self.temporal1(x))
+        out = self.relu(self.graph_conv(out, A_fixed, A_adp))
         out = self.temporal2(out)
 
-        # 4) Residual 연결
         if self.use_residual:
             if self.res_proj is not None:
                 identity = self.res_proj(identity)
             out = out + identity
 
-        # 5) ReLU + Dropout
-        out = self.relu(out)
-        out = self.dropout(out)
-
+        out = self.dropout(self.relu(out))
         return out
 
 
 class STGCNMultiTask(nn.Module):
-    """
-    전체 ST-GCN 멀티태스크 모델.
-
-    입력:
-      x: (B, N, T_in, F)
-
-    출력:
-      y_hat: (B, N, T_out, num_targets=2)
-    """
-
     def __init__(
         self,
         N_nodes: int,
@@ -263,6 +298,10 @@ class STGCNMultiTask(nn.Module):
         kernel_size: int = 3,
         dropout: float = 0.1,
         use_residual: bool = True,
+        use_adaptive_adj: bool = True,
+        adj_emb_dim: int = 16,
+        gcn_beta: float = 0.3,
+        adaptive_warmup_epochs: int = 0,
     ):
         super().__init__()
         self.N_nodes = N_nodes
@@ -270,49 +309,75 @@ class STGCNMultiTask(nn.Module):
         self.F_in = F_in
         self.T_out = T_out
         self.num_targets = num_targets
+        self.adaptive_warmup_epochs = adaptive_warmup_epochs
+        self.current_epoch = 0
 
-        A = torch.tensor(A_norm, dtype=torch.float32)
-        self.register_buffer("A", A)
+        # ✅ 고정 A는 sparse로 (중요!)
+        A_dense = torch.tensor(A_norm, dtype=torch.float32)
+        A_fixed = A_dense.to_sparse().coalesce()
+        self.register_buffer("A_fixed", A_fixed)
+
+        self.use_adaptive_adj = use_adaptive_adj
+        self.gcn_beta = gcn_beta
+
+        if use_adaptive_adj:
+            self.adp_adj = AdaptiveAdjacencyMasked(A_norm, emb_dim=adj_emb_dim)
+        else:
+            self.adp_adj = None
 
         blocks = []
         in_c = F_in
-        for b in range(num_blocks):
-            block = STGCNBlock(
-                in_channels=in_c,
-                out_channels=hidden_channels,
-                kernel_size=kernel_size,
-                use_residual=use_residual,
-                dropout=dropout,
+        for _ in range(num_blocks):
+            blocks.append(
+                STGCNBlock(
+                    in_channels=in_c,
+                    out_channels=hidden_channels,
+                    kernel_size=kernel_size,
+                    use_residual=use_residual,
+                    dropout=dropout,
+                    gcn_beta=gcn_beta,   # ✅ 반영
+                )
             )
-            blocks.append(block)
             in_c = hidden_channels
 
         self.blocks = nn.ModuleList(blocks)
-
-        # 마지막 hidden feature(C) → T_out * num_targets
         self.fc_out = nn.Linear(hidden_channels, T_out * num_targets)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, N, T_in, F) → y: (B, N, T_out, num_targets)
+        x: (B, N, T_in, F) -> y: (B, N, T_out, num_targets)
         """
         B, N, T_in, F = x.shape
-        assert N == self.N_nodes, "노드 수 N이 인접행렬과 맞지 않습니다"
-        assert T_in == self.T_in and F == self.F_in
+        assert N == self.N_nodes and T_in == self.T_in and F == self.F_in
 
-        # (B, N, T, F) -> (B, F, T, N)
-        x = x.permute(0, 3, 2, 1)  # (B, F, T_in, N)
+        x = x.permute(0, 3, 2, 1)  # (B, F, T, N)
+
+        use_adp_now = (
+            self.use_adaptive_adj
+            and (self.adp_adj is not None)
+            and (self.current_epoch > self.adaptive_warmup_epochs)
+        )
+        A_adp = self.adp_adj() if use_adp_now else None
 
         for block in self.blocks:
-            x = block(x, self.A)  # (B, hidden, T_in, N)
+            x = block(x, self.A_fixed, A_adp)
 
-        # 마지막 시간 스텝만 사용
-        h_last = x[:, :, -1, :]    # (B, hidden, N)
-        h_last = h_last.permute(0, 2, 1)  # (B, N, hidden)
-
-        y_flat = self.fc_out(h_last)  # (B, N, T_out * num_targets)
-        y = y_flat.view(B, N, self.T_out, self.num_targets)
+        h_last = x[:, :, -1, :].permute(0, 2, 1)  # (B, N, hidden)
+        y = self.fc_out(h_last).view(B, N, self.T_out, self.num_targets)
         return y
+    
+    def set_epoch(self, epoch: int):
+        self.current_epoch = int(epoch)
+        # optional: warmup 이후 10epoch 동안 beta를 0->gcn_beta로 ramp
+        if self.current_epoch <= self.adaptive_warmup_epochs:
+            cur_beta = 0.0
+        else:
+            ramp = min(1.0, (self.current_epoch - self.adaptive_warmup_epochs) / 10.0)
+            cur_beta = self.gcn_beta * ramp
+
+        # 모든 block의 graph_conv.beta 갱신
+        for blk in self.blocks:
+            blk.graph_conv.beta = cur_beta
 
 
 # =========================
@@ -440,6 +505,10 @@ def main():
         kernel_size=3,
         dropout=DROPOUT_P,
         use_residual=True,
+        use_adaptive_adj=True,    # ✅ 켜기
+        adj_emb_dim=16,           # ✅ 튜닝 대상 (8/16/32)
+        gcn_beta=0.3,             # ✅ 고정A vs adaptiveA 섞는 비율
+        adaptive_warmup_epochs=10,
     ).to(device)
 
     print(model)
@@ -456,6 +525,7 @@ def main():
     best_state = None
 
     for epoch in range(1, num_epochs + 1):
+        model.set_epoch(epoch)
         train_loss, train_mae_all, train_mae_tr, train_mae_sp = train_one_epoch(
             model, train_loader, optimizer, criterion
         )
