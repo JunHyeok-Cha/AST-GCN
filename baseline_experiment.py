@@ -25,7 +25,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 # 0. 공통 설정
 # =========================
 
-data_dir = Path("/mnt/c/Source/python/AST-GCN/res")
+data_dir = Path("/mnt/c/새 폴더/res")
 
 # 🔥 multi-task용 X/Y 파일 (TotalTraffic + Speed 동시 예측)
 X_path = data_dir / "X_samples.npy"
